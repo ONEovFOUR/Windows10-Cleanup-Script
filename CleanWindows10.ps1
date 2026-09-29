@@ -94,6 +94,138 @@ function Get-DirectorySize {
     }
 }
 
+function Get-LargeFilesReport {
+    param(
+        [string]$RootPath = $env:USERPROFILE,
+        [long]$MinSizeMB = 100,
+        [int]$Limit = 50
+    )
+
+    if (-not (Test-Path $RootPath)) { return @() }
+
+    $minBytes = $MinSizeMB * 1MB
+    $largeFiles = @()
+
+    try {
+        $files = Get-ChildItem -Path $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue | 
+                 Where-Object { $_.Length -ge $minBytes } | 
+                 Sort-Object -Property Length -Descending | 
+                 Select-Object -First $Limit
+
+        foreach ($file in $files) {
+            $largeFiles += [pscustomobject]@{
+                Name = $file.Name
+                Path = $file.FullName
+                Size = $file.Length
+                SizeFormatted = Get-SizeString $file.Length
+                Modified = $file.LastWriteTime
+            }
+        }
+    }
+    catch {
+        Write-CleanupLog "Error scanning for large files in $RootPath : $($_.Exception.Message)" "Warning"
+    }
+
+    return $largeFiles
+}
+
+function Find-DuplicateFiles {
+    param(
+        [string]$RootPath = $env:USERPROFILE,
+        [int]$Limit = 100
+    )
+
+    if (-not (Test-Path $RootPath)) { return @() }
+
+    $duplicates = @{}
+    $dupList = @()
+
+    try {
+        $files = Get-ChildItem -Path $RootPath -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First 5000
+
+        foreach ($file in $files) {
+            try {
+                $hash = (Get-FileHash -Path $file.FullName -Algorithm MD5 -ErrorAction SilentlyContinue).Hash
+                if ($hash) {
+                    if ($duplicates.ContainsKey($hash)) {
+                        $duplicates[$hash] += @($file.FullName)
+                    }
+                    else {
+                        $duplicates[$hash] = @($file.FullName)
+                    }
+                }
+            }
+            catch {
+                # skip files that can't be hashed
+            }
+        }
+
+        foreach ($hash in $duplicates.Keys) {
+            if ($duplicates[$hash].Count -gt 1) {
+                $dupList += [pscustomobject]@{
+                    Hash = $hash
+                    Count = $duplicates[$hash].Count
+                    Files = $duplicates[$hash]
+                    TotalSize = (Get-ChildItem -LiteralPath $duplicates[$hash][0] -Force).Length * $duplicates[$hash].Count
+                }
+            }
+        }
+    }
+    catch {
+        Write-CleanupLog "Error scanning for duplicates in $RootPath : $($_.Exception.Message)" "Warning"
+    }
+
+    return $dupList | Select-Object -First $Limit
+}
+
+function Clean-AppCaches {
+    param([switch]$DryRun,[switch]$BackupDeleted,[string]$BackupRoot = "")
+
+    $appCachePaths = @(
+        "$env:LOCALAPPDATA\Microsoft\Windows\INetCache",
+        "$env:APPDATA\Microsoft\Windows\Recent",
+        "$env:LOCALAPPDATA\Temp\VCpkg",
+        "$env:LOCALAPPDATA\NuGet\Cache",
+        "$env:LOCALAPPDATA\pip\Cache",
+        "$env:APPDATA\.gradle\caches"
+    )
+
+    $totalCount = 0
+    $totalSize = 0
+
+    foreach ($path in $appCachePaths) {
+        if (Test-Path $path) {
+            try {
+                $items = Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | Select-Object -First 200
+                foreach ($item in $items) {
+                    try {
+                        $itemSize = if ($item.PSIsContainer) { Get-DirectorySize -Path $item.FullName } else { [long]$item.Length }
+                        $totalSize += $itemSize
+
+                        if ($BackupDeleted -and -not $DryRun) {
+                            Backup-ItemIfNeeded -Item $item -BackupFolder $BackupRoot -Enabled $true
+                        }
+
+                        if (-not $DryRun) {
+                            if ($item.PSIsContainer) {
+                                Remove-Item -Path $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                            }
+                            else {
+                                Remove-Item -Path $item.FullName -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                        $totalCount++
+                    }
+                    catch {}
+                }
+            }
+            catch {}
+        }
+    }
+
+    return [pscustomobject]@{ Count = $totalCount; Size = $totalSize }
+}
+
 function Enable-PreflightRestorePoint {
     $restoreCommand = Get-Command Checkpoint-Computer -ErrorAction SilentlyContinue
     if ($null -eq $restoreCommand) {
@@ -279,29 +411,6 @@ function Organize-FilesByExtension {
     return [pscustomobject]@{ Count = $count; Moved = $moved }
 }
 
-function Get-PreviewSummary {
-    param(
-        [hashtable]$Options,
-        [bool]$BackupDeleted,
-        [bool]$DryRun,
-        [bool]$CreateRestorePoint
-    )
-
-    $summary = New-Object System.Collections.Generic.List[string]
-    $summary.Add("Profile: " + $(if ($Options["Deep"]) { "Deep" } else { "Quick" }))
-    $summary.Add("Dry Run: $DryRun")
-    $summary.Add("Create Restore Point: $CreateRestorePoint")
-    $summary.Add("Backup Deleted Items: $BackupDeleted")
-
-    foreach ($name in @("TempFiles", "RecycleBin", "BrowserCache", "Prefetch", "Logs", "Downloads", "Desktop")) {
-        if ($Options[$name]) {
-            $summary.Add("- $name")
-        }
-    }
-
-    return $summary
-}
-
 Initialize-CleanupPaths
 
 # ---------- Dark Theme ----------
@@ -316,8 +425,8 @@ $SubText = [System.Windows.Media.Color]::FromArgb(255, 180, 180, 180)
 # ---------- Window ----------
 $window = New-Object System.Windows.Window
 $window.Title = "Windows 10 Cleanup & Organizer"
-$window.Width = 780
-$window.Height = 810
+$window.Width = 800
+$window.Height = 950
 $window.WindowStartupLocation = "CenterScreen"
 $window.ResizeMode = "CanResize"
 $window.Background = New-Object System.Windows.Media.SolidColorBrush($DarkBg)
@@ -346,6 +455,9 @@ $header.Child = $title
 [System.Windows.Controls.Grid]::SetRow($header, 0)
 $grid.Children.Add($header) | Out-Null
 
+$scrollViewer = New-Object System.Windows.Controls.ScrollViewer
+$scrollViewer.VerticalScrollBarVisibility = "Auto"
+
 $body = New-Object System.Windows.Controls.StackPanel
 $body.Margin = "20,20,20,10"
 
@@ -353,11 +465,13 @@ $checkItems = @(
     @{ Name = "TempFiles"; Text = "Clean Temp Files"; Checked = $true },
     @{ Name = "RecycleBin"; Text = "Empty Recycle Bin"; Checked = $true },
     @{ Name = "BrowserCache"; Text = "Clear Browser Cache"; Checked = $true },
+    @{ Name = "AppCaches"; Text = "Clean Application Caches"; Checked = $true },
     @{ Name = "Prefetch"; Text = "Remove Prefetch Files"; Checked = $true },
     @{ Name = "Logs"; Text = "Delete Old Log Files"; Checked = $true },
     @{ Name = "Downloads"; Text = "Organize Downloads Folder"; Checked = $true },
     @{ Name = "Desktop"; Text = "Organize Desktop Files"; Checked = $true },
-    @{ Name = "Deep"; Text = "Deep Clean Mode"; Checked = $false }
+    @{ Name = "ScanLargeFiles"; Text = "Scan for Large Files (Info Only)"; Checked = $false },
+    @{ Name = "ScanDuplicates"; Text = "Scan for Duplicates (Info Only)"; Checked = $false }
 )
 
 $checkboxes = @{}
@@ -365,8 +479,8 @@ foreach ($item in $checkItems) {
     $cb = New-Object System.Windows.Controls.CheckBox
     $cb.Content = $item.Text
     $cb.IsChecked = $item.Checked
-    $cb.FontSize = 16
-    $cb.Margin = "0,8,0,8"
+    $cb.FontSize = 12
+    $cb.Margin = "0,6,0,6"
     $cb.Foreground = New-Object System.Windows.Media.SolidColorBrush($Text)
     $cb.Background = New-Object System.Windows.Media.SolidColorBrush($PanelBg)
     $checkboxes[$item.Name] = $cb
@@ -416,14 +530,16 @@ $body.Children.Add($progress) | Out-Null
 
 $resultsBlock = New-Object System.Windows.Controls.TextBlock
 $resultsBlock.Text = ""
-$resultsBlock.FontSize = 12
+$resultsBlock.FontSize = 11
 $resultsBlock.TextWrapping = "Wrap"
 $resultsBlock.Foreground = New-Object System.Windows.Media.SolidColorBrush($SubText)
 $resultsBlock.Margin = "0,0,0,10"
+$resultsBlock.MaxHeight = 200
 $body.Children.Add($resultsBlock) | Out-Null
 
-[System.Windows.Controls.Grid]::SetRow($body, 1)
-$grid.Children.Add($body) | Out-Null
+$scrollViewer.Content = $body
+[System.Windows.Controls.Grid]::SetRow($scrollViewer, 1)
+$grid.Children.Add($scrollViewer) | Out-Null
 
 $buttons = New-Object System.Windows.Controls.StackPanel
 $buttons.Orientation = "Horizontal"
@@ -486,116 +602,123 @@ $startButton.Add_Click({
 
         $totalCount = 0
         $totalFreed = 0
-        $steps = @(
-            "TempFiles",
-            "RecycleBin",
-            "BrowserCache",
-            "Prefetch",
-            "Logs",
-            "Downloads",
-            "Desktop"
-        )
-
-        $selectedStepsCount = 0
-        foreach ($step in $steps) {
-            if ($selectedSteps[$step]) { $selectedStepsCount++ }
-        }
-
-        $stepIndex = 0
+        $resultsSummary = @()
 
         if ($selectedSteps["TempFiles"]) {
-            $stepIndex++
             $statusBlock.Text = "Cleaning temp files..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             $r1 = Remove-PathContentsSafely -Path "$env:TEMP" -Limit 500 -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
             $r2 = Remove-PathContentsSafely -Path "$env:WINDIR\Temp" -Limit 500 -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
             $r3 = Remove-PathContentsSafely -Path "$env:LOCALAPPDATA\Temp" -Limit 500 -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
             $totalCount += $r1.Count + $r2.Count + $r3.Count
             $totalFreed += $r1.Size + $r2.Size + $r3.Size
+            $resultsSummary += "Temp files: $($r1.Count + $r2.Count + $r3.Count) items, $(Get-SizeString ($r1.Size + $r2.Size + $r3.Size)) freed"
+            $progress.Value = 12
         }
 
         if ($selectedSteps["RecycleBin"]) {
-            $stepIndex++
             $statusBlock.Text = "Emptying Recycle Bin..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             if (-not $dryRun) {
                 $count = Empty-RecycleBinSafely
                 $totalCount += $count
+                $resultsSummary += "Recycle Bin: $count items cleared"
             }
-            else {
-                $totalCount += 0
-            }
+            $progress.Value = 25
         }
 
         if ($selectedSteps["BrowserCache"]) {
-            $stepIndex++
             $statusBlock.Text = "Clearing browser cache..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             $result = Clean-BrowserCachesSafely -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
             $totalCount += $result.Count
             $totalFreed += $result.Size
+            $resultsSummary += "Browser cache: $($result.Count) items, $(Get-SizeString $result.Size) freed"
+            $progress.Value = 37
+        }
+
+        if ($selectedSteps["AppCaches"]) {
+            $statusBlock.Text = "Cleaning application caches..."
+            $result = Clean-AppCaches -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
+            $totalCount += $result.Count
+            $totalFreed += $result.Size
+            $resultsSummary += "App caches: $($result.Count) items, $(Get-SizeString $result.Size) freed"
+            $progress.Value = 50
         }
 
         if ($selectedSteps["Prefetch"]) {
-            $stepIndex++
             $statusBlock.Text = "Removing prefetch files..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             $result = Remove-PathContentsSafely -Path "$env:WINDIR\Prefetch" -Limit 250 -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
             $totalCount += $result.Count
             $totalFreed += $result.Size
+            $resultsSummary += "Prefetch: $($result.Count) items, $(Get-SizeString $result.Size) freed"
+            $progress.Value = 62
         }
 
         if ($selectedSteps["Logs"]) {
-            $stepIndex++
             $statusBlock.Text = "Deleting old logs..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             $result = Remove-PathContentsSafely -Path "$env:WINDIR\Logs" -Limit 250 -DryRun:$dryRun -BackupDeleted:$backupItems -BackupRoot $script:BackupDir
             $totalCount += $result.Count
             $totalFreed += $result.Size
+            $resultsSummary += "Log files: $($result.Count) items, $(Get-SizeString $result.Size) freed"
+            $progress.Value = 75
         }
 
         if ($selectedSteps["Downloads"]) {
-            $stepIndex++
             $statusBlock.Text = "Organizing downloads..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             $downloadsPath = Get-WindowsFolderPath -FolderName 'Downloads'
             if (-not [string]::IsNullOrWhiteSpace($downloadsPath)) {
                 $downloadsMoved = Organize-FilesByExtension -RootFolder $downloadsPath -Limit 500 -DryRun:$dryRun
                 $totalCount += $downloadsMoved.Count
+                $resultsSummary += "Downloads organized: $($downloadsMoved.Count) items"
             }
+            $progress.Value = 85
         }
 
         if ($selectedSteps["Desktop"]) {
-            $stepIndex++
             $statusBlock.Text = "Organizing desktop..."
-            $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
-
             $desktopPath = Get-WindowsFolderPath -FolderName 'Desktop'
             if (-not [string]::IsNullOrWhiteSpace($desktopPath)) {
                 $desktopMoved = Organize-FilesByExtension -RootFolder $desktopPath -Limit 500 -DryRun:$dryRun
                 $totalCount += $desktopMoved.Count
+                $resultsSummary += "Desktop organized: $($desktopMoved.Count) items"
             }
+            $progress.Value = 88
+        }
+
+        if ($selectedSteps["ScanLargeFiles"]) {
+            $statusBlock.Text = "Scanning for large files..."
+            $largeFiles = Get-LargeFilesReport -RootPath $env:USERPROFILE -MinSizeMB 100
+            if ($largeFiles.Count -gt 0) {
+                $sizeStr = Get-SizeString ($largeFiles | Measure-Object -Property Size -Sum).Sum
+                $resultsSummary += "Large files found: $($largeFiles.Count) files totaling $sizeStr (info only)"
+            }
+            $progress.Value = 92
+        }
+
+        if ($selectedSteps["ScanDuplicates"]) {
+            $statusBlock.Text = "Scanning for duplicate files..."
+            $duplicates = Find-DuplicateFiles -RootPath $env:USERPROFILE
+            if ($duplicates.Count -gt 0) {
+                $dupSize = Get-SizeString ($duplicates | Measure-Object -Property TotalSize -Sum).Sum
+                $resultsSummary += "Duplicates found: $($duplicates.Count) groups with potential savings of $dupSize (info only)"
+            }
+            $progress.Value = 96
         }
 
         $statusBlock.Text = if ($dryRun) { "Preview complete" } else { "Cleanup completed successfully" }
         $statusBlock.Foreground = New-Object System.Windows.Media.SolidColorBrush($Green)
         $progress.Value = 100
 
-        $summaryText = "Total items affected: $totalCount`nEstimated space reclaimed: $(Get-SizeString $totalFreed)"
+        $resultsBlock.Text = "═════════════════════════════════════`n"
+        $resultsBlock.Text += "Total items affected: $totalCount`n"
+        $resultsBlock.Text += "Estimated space reclaimed: $(Get-SizeString $totalFreed)`n`n"
+        $resultsBlock.Text += ($resultsSummary -join "`n")
+        $resultsBlock.Text += "`n═════════════════════════════════════`n"
+        
         if ($dryRun) {
-            $summaryText += "`nThis was a preview-only run. No files were deleted."
+            $resultsBlock.Text += "This was a preview-only run. No files were deleted."
         }
         if ($backupItems -and -not $dryRun) {
-            $summaryText += "`nBackups saved to: $script:BackupDir"
+            $resultsBlock.Text += "`nBackups saved to: $script:BackupDir"
         }
-
-        $resultsBlock.Text = $summaryText
 
         Write-CleanupLog "Cleanup run complete. DryRun=$dryRun. TotalItems=$totalCount. SpaceFreed=$totalFreed" "Success"
     }
@@ -617,5 +740,3 @@ $exitButton.Add_Click({
 $window.ShowDialog() | Out-Null
 
 # End of script
-
-
