@@ -19,6 +19,41 @@ function Initialize-CleanupPaths {
     }
 }
 
+function Get-WindowsFolderPath {
+    param(
+        [ValidateSet('Desktop', 'Downloads')]
+        [string]$FolderName
+    )
+
+    try {
+        switch ($FolderName) {
+            'Desktop' {
+                $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+                if (-not [string]::IsNullOrWhiteSpace($desktop)) { return $desktop }
+            }
+            'Downloads' {
+                $downloads = Join-Path $env:USERPROFILE 'Downloads'
+                if (Test-Path $downloads) { return $downloads }
+
+                try {
+                    $shell = New-Object -ComObject Shell.Application
+                    $folder = $shell.Namespace('shell:Downloads')
+                    if ($folder -and $folder.Self -and $folder.Self.Path) { return $folder.Self.Path }
+                }
+                catch {}
+
+                $fallback = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+                if (-not [string]::IsNullOrWhiteSpace($fallback)) { return $fallback }
+            }
+        }
+    }
+    catch {
+        Write-CleanupLog "Folder resolution failed for $FolderName: $($_.Exception.Message)" "Warning"
+    }
+
+    return $null
+}
+
 function Write-CleanupLog {
     param(
         [string]$Message,
@@ -529,9 +564,11 @@ $startButton.Add_Click({
             $statusBlock.Text = "Organizing downloads..."
             $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
 
-            $downloadsPath = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Downloads)
-            $downloadsMoved = Organize-FilesByExtension -RootFolder $downloadsPath -Limit 500 -DryRun:$dryRun
-            $totalCount += $downloadsMoved.Count
+            $downloadsPath = Get-WindowsFolderPath -FolderName 'Downloads'
+            if (-not [string]::IsNullOrWhiteSpace($downloadsPath)) {
+                $downloadsMoved = Organize-FilesByExtension -RootFolder $downloadsPath -Limit 500 -DryRun:$dryRun
+                $totalCount += $downloadsMoved.Count
+            }
         }
 
         if ($selectedSteps["Desktop"]) {
@@ -539,9 +576,11 @@ $startButton.Add_Click({
             $statusBlock.Text = "Organizing desktop..."
             $progress.Value = [int](($stepIndex / [Math]::Max(1, $selectedStepsCount)) * 100)
 
-            $desktopPath = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Desktop)
-            $desktopMoved = Organize-FilesByExtension -RootFolder $desktopPath -Limit 500 -DryRun:$dryRun
-            $totalCount += $desktopMoved.Count
+            $desktopPath = Get-WindowsFolderPath -FolderName 'Desktop'
+            if (-not [string]::IsNullOrWhiteSpace($desktopPath)) {
+                $desktopMoved = Organize-FilesByExtension -RootFolder $desktopPath -Limit 500 -DryRun:$dryRun
+                $totalCount += $desktopMoved.Count
+            }
         }
 
         $statusBlock.Text = if ($dryRun) { "Preview complete" } else { "Cleanup completed successfully" }
@@ -578,3 +617,5 @@ $exitButton.Add_Click({
 $window.ShowDialog() | Out-Null
 
 # End of script
+
+
